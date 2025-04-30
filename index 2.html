@@ -1,0 +1,164 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8" />
+  <title>住宅写真記録ツール - クラスタリング版</title>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/exif-js/2.3.0/exif.min.js"></script>
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.css" />
+  <style>
+    body { font-family: sans-serif; margin: 0; padding: 0; }
+    #map { height: 80vh; width: 100%; }
+    #photo-gallery { height: 20vh; overflow-x: auto; white-space: nowrap; background: #f5f5f5; padding: 10px; display: flex; align-items: center; }
+    .photo-thumb { height: 100px; margin-right: 10px; cursor: pointer; }
+    .photo-thumb:hover { outline: 2px solid blue; }
+    .control { padding: 1em; }
+  </style>
+</head>
+<body>
+  <div class="control">
+    <input type="file" id="image-folder" webkitdirectory directory multiple />
+    <label>クラスタリング半径 (km): <input type="number" id="cluster-radius" value="0.05" step="0.01" min="0.01" max="1" /></label>
+    <button onclick="processPhotos()">クラスタ適用</button>
+    <button onclick="downloadJSON()">JSONダウンロード</button>
+    <span id="status"></span>
+  </div>
+  <div id="map"></div>
+  <div id="photo-gallery"></div>
+  <script>
+    let map = L.map('map').setView([35.749, 139.805], 15);
+    L.tileLayer('https://cyberjapandata.gsi.go.jp/xyz/std/{z}/{x}/{y}.png', {
+      attribution: '© 地理院タイル',
+      maxZoom: 18
+    }).addTo(map);
+
+    const imageInput = document.getElementById('image-folder');
+    const gallery = document.getElementById('photo-gallery');
+    const clusterRadiusInput = document.getElementById('cluster-radius');
+    const status = document.getElementById('status');
+    let photoData = [];
+    let markers = [];
+
+    function getExifLatLng(file) {
+      return new Promise((resolve) => {
+        EXIF.getData(file, function () {
+          const lat = EXIF.getTag(this, "GPSLatitude");
+          const latRef = EXIF.getTag(this, "GPSLatitudeRef");
+          const lng = EXIF.getTag(this, "GPSLongitude");
+          const lngRef = EXIF.getTag(this, "GPSLongitudeRef");
+          if (!lat || !lng) return resolve(null);
+          const toDecimal = (dms) => dms[0] + dms[1]/60 + dms[2]/3600;
+          let latitude = toDecimal(lat);
+          let longitude = toDecimal(lng);
+          if (latRef === "S") latitude = -latitude;
+          if (lngRef === "W") longitude = -longitude;
+          resolve([latitude, longitude]);
+        });
+      });
+    }
+
+    function getExifDate(file) {
+      return new Promise((resolve) => {
+        EXIF.getData(file, function () {
+          const raw = EXIF.getTag(this, "DateTimeOriginal");
+          if (!raw) return resolve(null);
+          resolve(raw.replace(/:/g, '-').replace(' ', 'T'));
+        });
+      });
+    }
+
+    imageInput.addEventListener('change', async (event) => {
+      const files = Array.from(event.target.files).filter(f => f.type.startsWith('image/'));
+      photoData = [];
+
+      for (let file of files) {
+        const latLng = await getExifLatLng(file);
+        const date = await getExifDate(file);
+        const objectURL = URL.createObjectURL(file);
+        if (!latLng) continue;
+
+        photoData.push({
+          fileName: file.name,
+          latitude: latLng[0],
+          longitude: latLng[1],
+          dateTime: date || null,
+          url: objectURL
+        });
+      }
+      status.textContent = `${photoData.length}枚の写真を読み込みました`;
+      processPhotos();
+    });
+
+    function getDistance(lat1, lon1, lat2, lon2) {
+      const R = 6371;
+      const dLat = (lat2 - lat1) * Math.PI / 180;
+      const dLon = (lon2 - lon1) * Math.PI / 180;
+      const a = Math.sin(dLat/2)**2 + Math.cos(lat1*Math.PI/180)*Math.cos(lat2*Math.PI/180)*Math.sin(dLon/2)**2;
+      return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+    }
+
+    function processPhotos() {
+      markers.forEach(m => map.removeLayer(m));
+      markers = [];
+      gallery.innerHTML = "";
+
+      const clusters = [];
+      const radius = parseFloat(clusterRadiusInput.value);
+      const assigned = new Array(photoData.length).fill(false);
+
+      for (let i = 0; i < photoData.length; i++) {
+        if (assigned[i]) continue;
+        const cluster = [photoData[i]];
+        assigned[i] = true;
+
+        for (let j = i + 1; j < photoData.length; j++) {
+          if (assigned[j]) continue;
+          const d = getDistance(photoData[i].latitude, photoData[i].longitude, photoData[j].latitude, photoData[j].longitude);
+          if (d <= radius) {
+            cluster.push(photoData[j]);
+            assigned[j] = true;
+          }
+        }
+        clusters.push(cluster);
+      }
+
+      clusters.forEach(group => {
+        const lat = group.reduce((sum, p) => sum + p.latitude, 0) / group.length;
+        const lng = group.reduce((sum, p) => sum + p.longitude, 0) / group.length;
+        const marker = L.marker([lat, lng]).addTo(map);
+        marker.bindPopup(`${group.length} 枚の写真`);
+
+        marker.on('click', () => {
+          gallery.innerHTML = '';
+          group.forEach(photo => {
+            const img = document.createElement('img');
+            img.src = photo.url;
+            img.className = 'photo-thumb';
+            img.title = photo.fileName;
+            gallery.appendChild(img);
+          });
+        });
+
+        markers.push(marker);
+      });
+
+      status.textContent = `クラスタ数：${clusters.length}`;
+    }
+
+    function downloadJSON() {
+      const output = photoData.map(p => ({
+        fileName: p.fileName,
+        latitude: p.latitude,
+        longitude: p.longitude,
+        dateTime: p.dateTime
+      }));
+      const blob = new Blob([JSON.stringify(output, null, 2)], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = 'photo-database.json';
+      a.click();
+    }
+  </script>
+</body>
+</html>
